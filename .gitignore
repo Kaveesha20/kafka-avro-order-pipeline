@@ -1,0 +1,26 @@
+# Virtual environment
+venv/
+.venv/
+env/
+ENV/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Kafka/Docker local data (if any gets created alongside the project)
+kraft-combined-logs/
+
+# Local screenshots/logs (not pushed to public repo)
+Outputs/
+outputs/
