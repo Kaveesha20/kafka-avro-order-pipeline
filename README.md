@@ -128,15 +128,3 @@ Expected output: two DLQ records — one `malformed_avro`, one
 `processing_failure` — each with their error message and (where available)
 the original event data.
 
-## Notes for the report
-
-- Local `.avsc` file vs Schema Registry: trade-off is simplicity vs
-  centralized schema evolution/compatibility management across teams.
-- Retry + DLQ pattern: distinguishes *transient* failures (worth retrying)
-  from *unrecoverable* ones (malformed data — no amount of retrying fixes a
-  corrupt payload), which is why malformed Avro skips retry and goes
-  straight to DLQ, while business-rule failures go through the retry loop
-  first.
-- Running average is maintained as manual in-process state here (dict
-  keyed by product) — contrast this with Spark Structured Streaming's
-  built-in windowed aggregations from the earlier phase of this project.
