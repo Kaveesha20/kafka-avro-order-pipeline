@@ -1,130 +1,98 @@
 # Kafka Avro Order Processing Pipeline
 
-A Kafka pipeline that produces and consumes **Avro-serialized** order events,
-maintains a **running average** of order amounts per customer, and handles
-failures gracefully with **retry logic** and a **Dead Letter Queue (DLQ)**.
+This project is a Kafka-based system for producing and consuming order messages using Avro serialization. It supports real-time aggregation (running average price), retry logic for temporary failures, and a Dead Letter Queue (DLQ) for messages that can't be processed.
 
-## Architecture
+## What it does
 
-```
-producer.py --(Avro bytes)--> [orders topic] --> consumer.py --> running avg per customer
-                                                       |
-                                          (malformed / failed after retries)
-                                                       v
-                                              [orders_dlq topic] --> dlq_inspector.py
-```
+- A producer generates order messages (`orderId`, `product`, `price`), serializes them with Avro, and sends them to a Kafka topic called `orders`.
+- A consumer reads from `orders`, decodes the Avro messages, and keeps a running average price per product as messages come in.
+- If a message fails to deserialize (bad/corrupt Avro), it's sent straight to a DLQ topic (`orders_dlq`) — retrying doesn't help here since the bytes themselves are broken.
+- If a message deserializes fine but fails a business rule (e.g. negative price), the consumer retries it a few times before giving up and sending it to the DLQ.
+- A small script (`dlq_inspector.py`) lets you read back everything that ended up in the DLQ.
 
-- **Schema**: `schemas/order.avsc` — a local Avro schema file (no
-  Schema Registry), matching the assignment's required fields: `orderId`
-  (string), `product` (string), `price` (float). Producer and consumer both
-  read this file directly and must stay in sync manually.
-- **Producer**: generates fake order messages, serializes them to Avro
-  binary with `fastavro`, and publishes to the `orders` topic.
-- **Consumer**: deserializes Avro, validates business rules (price must be
-  positive), retries transient failures up to 3 times with backoff, and
-  routes unrecoverable messages to `orders_dlq`. Running average price is
-  tracked per product.
-- **DLQ**: a separate topic holding JSON records with the failure reason
-  (`malformed_avro` or `processing_failure`), the error, and the original
-  event/raw bytes for triage.
+## Why Avro instead of JSON
 
-## Why Avro over JSON (short version)
+The assignment required Avro, but even without that requirement it makes sense here: Kafka topics stay around for a long time and get read by consumers independently of when producers change. JSON doesn't enforce any structure, so a typo in a field name just becomes a silent bug somewhere downstream. Avro forces both sides to agree on a schema ahead of time, which also makes the messages smaller since field names aren't repeated in every message.
 
-Avro is binary and schema-typed, so messages are smaller and type-safe
-compared to JSON's text format and loose typing. In production, a Schema
-Registry manages schema versions/compatibility across services; here we use
-a local `.avsc` file, which is simpler but requires producer and consumer to
-manually stay in sync.
+I used a plain `.avsc` file instead of a Schema Registry since the assignment scope didn't need it — this is simpler to set up, but it means the producer and consumer both have to manually stay in sync on the schema file.
 
 ## Project structure
 
 ```
-kafka-avro-project/
+kafka-avro-order-pipeline/
 ├── README.md
+├── requirements.txt
 ├── schemas/
 │   └── order.avsc
 ├── producer/
 │   └── producer.py
 ├── consumer/
 │   └── consumer.py
-├── dlq/
-│   └── dlq_inspector.py
-└── tests/
-```
-
-## Prerequisites
-
-- Python 3.9+
-- A running Kafka broker on `localhost:9092` (e.g. via Docker:
-  `docker run -p 9092:9092 apache/kafka:latest`, or your existing local setup)
-- Install dependencies:
-
-```bash
-pip install fastavro kafka-python
+└── dlq/
+    └── dlq_inspector.py
 ```
 
 ## Setup
 
-Create the two topics (optional — Kafka can auto-create them, but explicit
-creation is cleaner for a demo):
+You need Python 3.9+ and a Kafka broker running on `localhost:9092`. I ran Kafka locally with Docker:
 
 ```bash
-kafka-topics.sh --create --topic orders --bootstrap-server localhost:9092 --partitions 1 --replication-factor 1
-kafka-topics.sh --create --topic orders_dlq --bootstrap-server localhost:9092 --partitions 1 --replication-factor 1
+docker run -p 9092:9092 apache/kafka:latest
 ```
 
-## Running the demo
+Install the Python dependencies:
 
-**Terminal 1 — start the consumer** (leave running):
+```bash
+pip install -r requirements.txt
+```
+
+Kafka is set to auto-create topics, so `orders` and `orders_dlq` get created automatically the first time a message is sent — no need to create them manually.
+
+## Running it
+
+Start the consumer first and leave it running:
 
 ```bash
 cd consumer
 python consumer.py
 ```
 
-**Terminal 2 — run the producer** to send normal traffic:
+Then, in a separate terminal, run the producer:
 
 ```bash
 cd producer
-python producer.py --count 20 --delay 0.5
+python producer.py
 ```
 
-Watch Terminal 1 — you'll see each order deserialized and the running
-average per customer update live.
+You'll see the consumer print out each message it receives and the updated running average for that product.
 
-## Testing the DLQ (failure scenarios)
+## Testing the failure handling
 
-Two failure modes are built into the producer via flags:
+There are two flags on the producer to trigger the failure paths:
 
-**1. Malformed Avro (fails deserialization):**
-
+**Malformed Avro message:**
 ```bash
 python producer.py --count 10 --inject-bad-avro
 ```
+This sends one message that isn't valid Avro at all. The consumer fails to deserialize it and sends it straight to the DLQ — no retry, since retrying wouldn't fix corrupt bytes.
 
-The consumer will hit the corrupt message mid-stream, fail to deserialize
-it, and immediately route it to `orders_dlq` with `reason: malformed_avro`
-— without crashing or blocking subsequent messages.
-
-**2. Valid Avro but invalid business data (fails processing after retries):**
-
+**Valid message, invalid data (negative price):**
 ```bash
 python producer.py --count 10 --inject-negative-price
 ```
+This message deserializes fine but fails the price validation check. The consumer retries it 3 times with a short backoff before sending it to the DLQ.
 
-The consumer will successfully deserialize this message, but
-`validate_business_rules` will reject the negative price. You'll see it
-retry 3 times with increasing backoff in Terminal 1, then route it to
-`orders_dlq` with `reason: processing_failure`.
+Both of these can be run against the same consumer session — it doesn't need to be restarted between runs, since it just keeps listening on the topic the whole time.
 
-**3. Inspect the DLQ** to confirm both failure types landed there:
-
+**To check what ended up in the DLQ:**
 ```bash
 cd dlq
 python dlq_inspector.py
 ```
+This prints out every message currently in `orders_dlq`, along with why it failed (`malformed_avro` or `processing_failure`).
 
-Expected output: two DLQ records — one `malformed_avro`, one
-`processing_failure` — each with their error message and (where available)
-the original event data.
+## A few design notes
 
+- Malformed messages skip the retry loop entirely — if the bytes are broken, retrying doesn't change that, so it goes straight to DLQ. Business-rule failures (like a negative price) get a few retry attempts first, since in a real system that kind of failure could sometimes be transient.
+- The running average is just kept in memory (a dictionary keyed by product) — it resets if the consumer restarts. A more production-ready version would persist this somewhere.
+- DLQ messages are stored as JSON rather than Avro, mainly so they're easy to read directly and because a malformed message might not even be valid Avro to begin with.
